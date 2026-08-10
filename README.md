@@ -13,14 +13,14 @@ Summon the Specification engine into your project:
 <dependency>  
 	 <groupId>com.ensemblu</groupId> 
 	 <artifactId>axiom-spec</artifactId> 
-	 <version>1.0.0</version>
+	 <version>2.0.0</version>
 </dependency>  
 ```  
 
 **Gradle**
 
 ```groovy  
-implementation("com.ensemblu:axiom-spec:1.0.0")  
+implementation("com.ensemblu:axiom-spec:2.0.0")  
 ```  
 
 ## ⚖️ Sovereign Law
@@ -51,10 +51,10 @@ Ingest raw data with native character scanners:
 
 ```java  
 // JSON  
-final var data = JsonParser.take(jsonString).openBuffer().ensureRootIsObject().parseObject();  
+final var data = JsonParser.take(jsonString.getBytes(StandardCharsets.UTF_8)).openBuffer().ensureRootIsObject().parseObject();  
   
 // CSV  
-final var row = CsvRowParser.takeLine("val1,val2").basedOnHeaders("col1", "col2");  
+final var row = CsvRowParser.takeLine("val1,val2".getBytes(StandardCharsets.UTF_8)).basedOnHeaders("col1", "col2");  
 ```  
 
 ### 3. Structural Materialization
