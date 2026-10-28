@@ -1,36 +1,46 @@
-
-# 📐 Axiom Spec
-
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-3.0.0-blue)
 ![Java](https://img.shields.io/badge/Java-26-orange)
 ![Depends](https://img.shields.io/badge/depends%20on-axiom-informational)
 ![License](https://img.shields.io/badge/license-Limited%20Commercial-red)
 
-**Specification layer: parsers, emitters, database contracts, and materializers.**
+# Axiom Spec (`axiom-spec`)
 
-`axiom-spec` is the bridge between the outside world (CSV, JSON, SQL templates, JDBC/Vert.x rows) and Axiom’s immutable core. It owns the **byte-oriented** CSV and JSON parsers, the production-grade **JSON emitter**, SQL template forging, and type-safe database binding protocols.
+> The standard contract layer of the Axiom ecosystem: off-heap JSON and CSV parsers, and a JSON emitter, that every
+> native driver and every application gateway shares.
 
----
-
-## What it does
-
-| Capability | Entry point |
-|------------|-------------|
-| CSV row parsing | `CsvRowParser.takeLine(byte[])` / `scanLine(byte[])` |
-| JSON parsing | `JsonParser.take(byte[])` |
-| JSON emission | `JsonEmitter.emit(Object)` |
-| SQL template → plan | `SqlParser.forge(String)` |
-| Row → `PersistentMap` | `RowMaterializer` |
-| Typed DB binding | `AxiomProtocol` + `AxiomRegistry` + `IngressBinder` |
-
-Zero reflection. Zero annotations. Character / byte scanners instead of heavy deserializers.
+`axiom-spec` defines how raw wire bytes become Axiom data and how Axiom data becomes wire bytes again. All parsers read
+directly from a Panama `MemorySegment` and produce frozen `PersistentMap` / `PersistentList` values. It is the shared
+base of every `axiom-warp-*-driver`.
 
 ---
 
-## Requirements
+## Architecture overview
 
-- **Java 26**
-- [`axiom`](https://github.com/ensemblu-corp/axiom) `2.0.0`
+```
+              bytes in (MemorySegment)                               bytes out (String)
+                       │                                                    ▲
+     ┌─────────────────┴──────────────────┐                                 │
+     ▼                                    ▼                                 │
+ JsonParser                          CsvRowParser                      JsonEmitter
+ take → openBuffer                   takeLine(segment)                 emit(Object)
+   ├─ ensureRootIsObject().parseObject()   .basedOnHeaders(..)              │
+   └─ ensureRootIsList()                                                    │
+     │                                    │                                 │
+     └────────────► PersistentMap / PersistentList ─────────────────────────┘
+                     (frozen into Arena.ofShared(); numbers via Dop.normalize)
+```
+
+| Class | Responsibility |
+|---|---|
+| `JsonParser` | Recursive-descent JSON parser over a `MemorySegment`. Enforces the expected root (`{}` or `[]`) before parsing. |
+| `JsonEmitter` | Serialises `PersistentMap`, `PersistentList`, `String`, `Number`, `Boolean`, `null` (anything else via `toString()`) to compact JSON. |
+| `CsvRowParser` | Parses a single CSV line (quote-aware) and zips it with headers into a map. |
+
+Dependency graph:
+
+```
+axiom  ◄──  axiom-spec  ◄──  axiom-warp-{postgresql,mysql,oracle,sqlite,sqlserver}-driver
+```
 
 ---
 
@@ -42,140 +52,104 @@ Zero reflection. Zero annotations. Character / byte scanners instead of heavy de
 <dependency>
     <groupId>com.ensemblu</groupId>
     <artifactId>axiom-spec</artifactId>
-    <version>2.0.0</version>
+    <version>3.0.0</version>
 </dependency>
 ```
 
-**Gradle**
+**Gradle (Kotlin DSL)**
 
-```groovy
-implementation("com.ensemblu:axiom-spec:2.0.0")
+```kotlin
+implementation("com.ensemblu:axiom-spec:3.0.0")
 ```
+
+JPMS automatic module name: `com.ensemblu.axiom.spec` · Runtime: JDK 26 with `--enable-preview`.
+
+> If you already depend on any `axiom-warp-*-driver`, `axiom-spec` is on your classpath transitively.
 
 ---
 
-## Quick start (2.0.0 APIs)
+## Usage examples
 
-### CSV
-
-```java
-import com.ensemblu.axiom.spec.parser.CsvRowParser;
-import java.nio.charset.StandardCharsets;
-
-byte[] line = "Ada,36,London".getBytes(StandardCharsets.UTF_8);
-
-var row = CsvRowParser.takeLine(line)
-    .basedOnHeaders("name", "age", "city");
-
-// or low-level scan
-var cells = CsvRowParser.scanLine(line);
-```
-
-### JSON parse
+### Parse a JSON object
 
 ```java
 import com.ensemblu.axiom.spec.parser.JsonParser;
+import java.lang.foreign.MemorySegment;
 
-byte[] json = "{\"name\":\"Ada\",\"age\":36}".getBytes(StandardCharsets.UTF_8);
+MemorySegment body = MemorySegment.ofArray(exchange.getRequestBody().readAllBytes());
 
-var data = JsonParser.take(json)
-    .openBuffer()
-    .ensureRootIsObject()
-    .parseObject();
+PersistentMap<String, Object> request = JsonParser
+        .take(body)
+        .openBuffer()
+        .ensureRootIsObject()      // throws "Contract Violation: Expected Object ({})" otherwise
+        .parseObject();
+
+String status = request.targetKey("status").toStringVal();
+int limit     = request.targetKey("limit").toIntVal();
 ```
 
-### JSON emit (replacement for removed `Dop.toJson`)
+### Parse a JSON array
+
+```java
+PersistentList<Object> items = JsonParser.take(segment).openBuffer().ensureRootIsList();
+```
+
+### Emit JSON
 
 ```java
 import com.ensemblu.axiom.spec.parser.JsonEmitter;
 
-String json = JsonEmitter.emit(myPersistentMap);
-// Correctly handles nested maps/lists, escaping, null, numbers, booleans
+var response = Axiom.Data.<String, Object>emptyMap()
+        .put("status", "OK")
+        .put("rows", rows);                 // PersistentList<PersistentMap<String,Object>>
+
+String json = JsonEmitter.emit(response);   // {"status":"OK","rows":[...]}
 ```
 
-### SQL template
+### Parse a CSV line
 
 ```java
-import com.ensemblu.axiom.spec.parser.SqlParser;
+import com.ensemblu.axiom.spec.parser.CsvRowParser;
 
-var plan = SqlParser.forge(
-    "INSERT INTO users (name, age) VALUES (:java.name, :java.age)"
-);
-// plan.sql()        → "INSERT INTO users (name, age) VALUES (?, ?)"
-// plan.indexToKey() → {0 → "name", 1 → "age"}
+var line = MemorySegment.ofArray("Ofek Malka,50000.00,ILS,ACTIVE".getBytes(StandardCharsets.UTF_8));
+
+PersistentMap<String, Object> row = CsvRowParser
+        .takeLine(line)
+        .basedOnHeaders("owner", "balance", "currency", "status");
+
+// Split a line without headers
+PersistentList<String> cells = CsvRowParser.scanLine(line);
 ```
 
-### Database handshake
+---
+
+## Behaviour and configuration guide
+
+`axiom-spec` has no configuration file. Behaviour you should design around:
+
+| Area | Behaviour |
+|---|---|
+| JSON numbers | Parsed as `double`, then normalised through `Dop.normalize`: whole values become `Integer` (or `Long` beyond int range), fractional values stay `Double`. Use `toIntVal()` / `toDoubleVal()` at the edge rather than casting. |
+| JSON strings | Escapes `\" \\ \n \r \t` are decoded; other escaped characters are taken literally (no `\uXXXX` decoding). |
+| JSON emitting | Escapes `\ " \b \f \n \r \t`. Output is compact (no whitespace). |
+| CSV | Comma separated, double-quote aware, each cell trimmed. Missing trailing cells become `null`. Blank or empty lines throw an `Axiom Contract Violation`. |
+| Memory | Parsed results are frozen into `Arena.ofShared()`, so they outlive the input segment. |
+| Errors | Malformed input throws `RuntimeException` with the byte position. Wrap with `Axiom.Check.attempt(..)` to get a `Result`. |
+
+Combine with [`axiom-language`](../axiom-language) to validate parsed JSON against a schema in one step:
 
 ```java
-IngressBinder.apply(binder, plan, contractMap, dataMap);
-var materialized = RowMaterializer.materialize(row);
-```
-
-> [!IMPORTANT]
-> **Breaking changes from 1.0.0**  
-> - `CsvRowParser.takeLine` / `scanLine` and `JsonParser.take` now take **`byte[]`**, not `String`.  
-> - `Dop.toJson` (from `axiom`) was removed — always use **`JsonEmitter.emit`**.
-
----
-
-## Package structure
-
-```
-com.ensemblu.axiom.spec
-├── parser
-│   ├── CsvRowParser.java      // takeLine(byte[]) / scanLine(byte[])
-│   ├── JsonParser.java        // take(byte[])
-│   ├── JsonEmitter.java       // emit(Object) → String
-│   └── SqlParser.java         // forge(String) → ExecutionPlan
-└── database
-    ├── binder/                // IngressBinder, type setters
-    └── materializer/
-        ├── RowMaterializer.java
-        ├── ResultRow.java
-        ├── AxiomProtocol.java
-        ├── AxiomRegistry.java
-        └── DefaultDataContract.java
+SchemaGuard.checkContent(body)
+        .basedOnSchemaInPath("schemas/request")
+        .withParser(seg -> JsonParser.take(seg).openBuffer().ensureRootIsObject().parseObject());
 ```
 
 ---
 
-## Structural guardrails
+## License
 
-- **CSV** — empty / null / whitespace-only input is a contract violation at the boundary.
-- **SQL** — `:java.key` signals are replaced with `?` placeholders; parameter order is captured in the plan.
-- **Protocol** — `AxiomProtocol` maps Java types to database-native setters without reflection.
-- **Registry** — `AxiomRegistry` resolves protocol names at runtime without class scanning.
+**Limited Commercial License** — free for evaluation, testing, and non-commercial development.
+Commercial or production use requires a paid annual contract.
+See [LICENSE](https://raw.githubusercontent.com/ensemblu-corp/axiom/main/LICENSE) · Contact: contact@ensemblu.com
 
----
-
-## How it fits
-
-```text
-CSV / JSON bytes ──► CsvRowParser / JsonParser ──► PersistentMap
-                                                      │
-SQL template ──────► SqlParser.forge ─────────────────┼──► binders / materializers
-                                                      │
-PersistentMap ─────► JsonEmitter.emit ──────────────► JSON string
-```
-
-Warp modules (`axiom-warp-jdbc`, `axiom-warp-reactive`) depend on this layer for ingestion and result shaping.
-
----
-
-## Related modules
-
-| Module | Relationship |
-|--------|----------------|
-| `axiom` | Core data structures & `Result` |
-| `axiom-warp-jdbc` | Uses parsers + materializers for blocking JDBC |
-| `axiom-warp-reactive` | Uses parsers + materializers for Vert.x pipelines |
-
----
-
-## Legal
-
-Limited Commercial License — free for evaluation, testing, and non-commercial development.  
-Commercial or production use requires a paid annual contract from Ensemblu Corp.
-
-See `LICENSE.md`. Contact: **contact@ensemblu.com**
+© Ensemblu Corp
